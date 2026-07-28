@@ -54,6 +54,14 @@ SECRETS_DIR = Path(os.environ.get("HOME", "")) / ".config/nexus/secrets"
 # set from argv in main(); module-level so the handler can read them
 ROOT: Path = BASE_DIR / "dist"
 
+# Ordered list of local env files (project-local overrides), set in main().
+# Precedence, highest first: process env  >  .local.env (these)  >  nexus.env  >  legacy key file.
+LOCAL_ENV_FILES: list = []
+
+# Files the STATIC server must never serve (defense in depth — secrets are never web-reachable
+# even if one lands inside the web root). Matches by basename suffix or a leading dot.
+SECRET_SUFFIXES = (".env", ".key", ".pem", ".secret", ".pfx", ".p12")
+
 MIME_TYPES = {
     ".html": "text/html", ".htm": "text/html", ".js": "application/javascript",
     ".mjs": "application/javascript", ".css": "text/css", ".json": "application/json",
@@ -104,12 +112,13 @@ UA = "nexus-web-server"
 LLM_PATH_RE = re.compile(r"^/api/llm/([A-Za-z0-9_.-]+)/(?:v1/)?chat/completions/?$")
 
 
-def load_secret(name):
-    """Read a secret from nexus.env (KEY=value); legacy pollinations.key fallback."""
-    if not name:
-        return None
+PROVIDER_RE = re.compile(r"^PROVIDER_([A-Za-z0-9]+)_BASE_URL$")
+
+
+def _read_env_var(path, name):
+    """Return the value of KEY=value for `name` in a dotenv-style file, or None."""
     try:
-        for line in (SECRETS_DIR / "nexus.env").read_text(encoding="utf-8").splitlines():
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -118,6 +127,86 @@ def load_secret(name):
                 return v.strip().strip('"').strip("'")
     except OSError:
         pass
+    return None
+
+
+def _read_env_file(path):
+    """Parse a whole dotenv file into {KEY: value}, or {} if missing."""
+    out = {}
+    try:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def _env_dict():
+    """Merged env view for scanning (not for single-key reads — use load_secret for those).
+    Applied low→high precedence so the final dict matches load_secret: nexus.env (base) <
+    .local.env files (later listed = lower) < process env (highest)."""
+    merged = {}
+    merged.update(_read_env_file(SECRETS_DIR / "nexus.env"))
+    for f in reversed(LOCAL_ENV_FILES):          # LOCAL_ENV_FILES[0] is highest → apply last
+        merged.update(_read_env_file(f))
+    merged.update({k: v for k, v in os.environ.items() if k.startswith("PROVIDER_")})
+    return merged
+
+
+def discover_providers():
+    """Built-in registry PLUS any providers declared in the env via the convention:
+        PROVIDER_<ID>_BASE_URL=https://host/v1     (required — makes <id> exist)
+        PROVIDER_<ID>_API_KEY=...                   (optional → requires_key; keyless if absent)
+        PROVIDER_<ID>_KIND=chat|image|chat+image    (optional, default chat)
+        PROVIDER_<ID>_LABEL=Friendly Name           (optional)
+    Env-declared providers override built-ins of the same id. Computed on demand, so editing
+    .local.env adds a provider with NO restart. This is what makes it a universal API server."""
+    provs = {pid: dict(p) for pid, p in PROVIDERS.items()}
+    env = _env_dict()
+    for k, v in env.items():
+        m = PROVIDER_RE.match(k)
+        if not m or not v.strip():
+            continue
+        raw, pid = m.group(1), m.group(1).lower()
+        keyvar = f"PROVIDER_{raw}_API_KEY"
+        has_key = bool(env.get(keyvar))
+        provs[pid] = {
+            "label": env.get(f"PROVIDER_{raw}_LABEL", pid),
+            "base_url": v.strip().rstrip("/"),
+            "key_env": keyvar if has_key else None,
+            "requires_key": has_key,
+            "kind": (env.get(f"PROVIDER_{raw}_KIND") or "chat").strip(),
+            "dynamic": True,
+        }
+    return provs
+
+
+def load_secret(name):
+    """Resolve a secret by precedence (highest first):
+         1) process environment       (os.environ[name])
+         2) .local.env project files  (LOCAL_ENV_FILES, in order)
+         3) ~/.config/nexus/secrets/nexus.env   (global)
+         4) legacy ~/.config/nexus/secrets/pollinations.key  (POLLINATIONS_API_KEY only)
+    Read on demand (edit a file, no restart). Never logged, never returned to the browser."""
+    if not name:
+        return None
+    # 1) real process env wins
+    if os.environ.get(name):
+        return os.environ[name].strip()
+    # 2) project-local .local.env (override), in listed order
+    for f in LOCAL_ENV_FILES:
+        v = _read_env_var(f, name)
+        if v:
+            return v
+    # 3) global nexus.env
+    v = _read_env_var(SECRETS_DIR / "nexus.env", name)
+    if v:
+        return v
+    # 4) legacy single-key file
     if name == "POLLINATIONS_API_KEY":
         try:
             return (SECRETS_DIR / "pollinations.key").read_text(encoding="utf-8").strip()
@@ -126,9 +215,18 @@ def load_secret(name):
     return None
 
 
-def keyed_providers():
+def is_secret_path(p: Path) -> bool:
+    """True if this file must never be served (dotfiles, .env/.key/.pem, etc.)."""
+    name = p.name.lower()
+    if name.startswith(".") and name not in (".well-known",):
+        return True
+    return name.endswith(SECRET_SUFFIXES)
+
+
+def keyed_providers(provs=None):
+    provs = provs if provs is not None else discover_providers()
     return {pid: ((not p["requires_key"]) or bool(load_secret(p["key_env"])))
-            for pid, p in PROVIDERS.items()}
+            for pid, p in provs.items()}
 
 
 def log(msg):
@@ -196,11 +294,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── registry ──────────────────────────────────────────────────────────────
     def _registry(self):
-        keyed = keyed_providers()
+        provs = discover_providers()
+        keyed = keyed_providers(provs)
         providers = {pid: {"id": pid, "label": p["label"], "kind": p["kind"],
                            "requires_key": p["requires_key"], "key_present": keyed[pid],
-                           "proxied": True}
-                     for pid, p in PROVIDERS.items()}
+                           "dynamic": p.get("dynamic", False), "proxied": True}
+                     for pid, p in provs.items()}
         return {"providers": providers, "defaults": DEFAULTS}
 
     # ── keyless passthrough (model lists) ─────────────────────────────────────
@@ -249,9 +348,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "bad JSON body", "detail": str(e)[:200]}, 400)
 
         pid = provider_from_url or payload.pop("provider", None)
-        prov = PROVIDERS.get(pid or "")
+        provs = discover_providers()
+        prov = provs.get(pid or "")
         if not prov:
-            return self._json({"error": f"unknown provider '{pid}'", "known": list(PROVIDERS)}, 400)
+            return self._json({"error": f"unknown provider '{pid}'", "known": list(provs)}, 400)
         base = (payload.pop("base_url", None) or prov["base_url"]).rstrip("/")
         url = f"{base}/chat/completions"
         headers = {"Content-Type": "application/json", "User-Agent": UA}
@@ -286,6 +386,10 @@ class Handler(BaseHTTPRequestHandler):
         root_r = ROOT.resolve()
         if not (target == root_r or str(target).startswith(str(root_r) + os.sep)):
             return None, False                       # traversal blocked
+        # never serve secrets/dotfiles — even if one sits inside the web root
+        if any(seg.startswith(".") and seg not in (".well-known",) for seg in rel.split("/") if seg) \
+           or is_secret_path(target):
+            return None, False
         if target.is_dir():
             idx = target / "index.html"
             return (idx if idx.is_file() else target), False   # dir -> its index.html (or dir marker)
@@ -334,8 +438,60 @@ class Handler(BaseHTTPRequestHandler):
         self._bytes(page.encode("utf-8"), "text/html")
 
 
+ENV_FILENAMES = (".local.env", ".env")           # recognised project-local secret files
+GITIGNORE_PATTERNS = [".local.env", ".env", "*.local.env", "*.env", "*.key", "*.pem", "nexus.env"]
+
+
+def discover_local_env(explicit, root):
+    """Ordered list of project-local env files (first found wins per key).
+    Kept OUTSIDE the browser's reach — these are never served (see is_secret_path).
+    Search dirs: CWD, script dir, and the web root's PARENT (project dir when serving dist/);
+    filenames: .local.env then .env. The root itself is intentionally NOT searched —
+    secrets don't belong in a docroot. An explicit --env path is honoured first."""
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit))
+    for d in (Path.cwd(), BASE_DIR, root.parent):
+        for fn in ENV_FILENAMES:
+            candidates.append(d / fn)
+    seen, found = set(), []
+    for c in candidates:
+        c = c.resolve()
+        if c in seen:
+            continue
+        seen.add(c)
+        if c.is_file():
+            found.append(c)
+    return found
+
+
+def ensure_gitignore(env_files):
+    """Safety net: whenever a secret env file is found, make sure a .gitignore in that same
+    folder excludes it (and sibling secret patterns). Append-only + idempotent — we never
+    overwrite an existing .gitignore, only add missing lines. Stops an accidental `git add`."""
+    for parent in {f.parent for f in env_files}:
+        gi = parent / ".gitignore"
+        try:
+            existing = gi.read_text(encoding="utf-8") if gi.is_file() else ""
+        except OSError:
+            existing = ""
+        have = {ln.strip() for ln in existing.splitlines()}
+        add = [p for p in GITIGNORE_PATTERNS if p not in have]
+        if not add:
+            continue
+        block = ("" if existing.endswith("\n") or not existing else "\n") \
+            + "\n# NeXuS: never commit secrets (auto-added by nexus_web_server)\n" \
+            + "\n".join(add) + "\n"
+        try:
+            with gi.open("a", encoding="utf-8") as fh:
+                fh.write(block)
+            log(f"🛡️  {'created' if not existing else 'updated'} {gi} (+{len(add)} secret patterns)")
+        except OSError as e:
+            log(f"⚠️  could not write {gi}: {e}")
+
+
 def main():
-    global ROOT
+    global ROOT, LOCAL_ENV_FILES
     ap = argparse.ArgumentParser(description="NeXuS portable HTTPS web server")
     ap.add_argument("--root", default=str(BASE_DIR / "dist"),
                     help="web root directory to serve (default: ./dist)")
@@ -343,11 +499,23 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--cert", default=None, help="TLS cert PEM (default: ./cert.pem)")
     ap.add_argument("--key",  default=None, help="TLS key PEM (default: ./key.pem)")
+    ap.add_argument("--env",  default=None,
+                    help="explicit .local.env path (overrides nexus.env; auto-discovered otherwise)")
     args = ap.parse_args()
 
     ROOT = Path(args.root).resolve()
     if not ROOT.is_dir():
         sys.exit(f"❌ web root not found: {ROOT}")
+
+    LOCAL_ENV_FILES = discover_local_env(args.env, ROOT)
+    if LOCAL_ENV_FILES:
+        ensure_gitignore(LOCAL_ENV_FILES)            # auto-protect found secrets from git
+    for f in LOCAL_ENV_FILES:
+        try:
+            if f.stat().st_mode & 0o077:
+                log(f"⚠️  {f} is {oct(f.stat().st_mode & 0o777)} — secrets should be chmod 600 (run: chmod 600 {f})")
+        except OSError:
+            pass
 
     cert = Path(args.cert) if args.cert else BASE_DIR / "cert.pem"
     key  = Path(args.key)  if args.key  else BASE_DIR / "key.pem"
@@ -365,6 +533,8 @@ def main():
     print("║   🔐 NeXuS WEB SERVER — portable HTTPS (Python, no npm)      ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     log(f"✅ HTTPS https://localhost:{args.port}   root={ROOT}")
+    src = " → ".join(["process-env"] + [str(f) for f in LOCAL_ENV_FILES] + [str(SECRETS_DIR / 'nexus.env')])
+    log(f"🗝️  secret precedence: {src}")
     log("🔑 provider keys: " + ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in keyed.items()))
     log("🛑 Ctrl+C to stop")
     try:

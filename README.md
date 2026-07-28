@@ -37,11 +37,34 @@ next to the script.
 | POST | `/api/llm/{provider}/v1/chat/completions` | same, **vanilla OpenAI body** (provider in URL) — for OpenCharacters & any "custom endpoint" client |
 | GET | `*` | static file under root (SPA fallback) |
 
-## Providers
+## Providers — built-in + env-declared (universal API server)
 
-Declared in one registry in the script; keys resolved by name from `nexus.env`.
-Keyless: `aihorde`, `ollama`, `aichat`. Key-required (proxied): `pollinations`, `openai`,
-`mistral`, `groq`, `openrouter`. Add your own by adding a line to `PROVIDERS`.
+Built-ins live in one registry in the script. Keyless: `aihorde`, `ollama`, `aichat`.
+Key-required (proxied): `pollinations`, `openai`, `mistral`, `groq`, `openrouter`.
+
+**Declare a brand-new provider with no code edit** — put it in `.local.env`; the proxy
+auto-registers it, `/api/providers` lists it, and it's callable at
+`POST /api/llm/<id>/v1/chat/completions`:
+
+```ini
+PROVIDER_<ID>_BASE_URL=https://host/v1     # required — makes <id> exist
+PROVIDER_<ID>_API_KEY=...                  # optional → key-required; absent → keyless
+PROVIDER_<ID>_KIND=chat|image|chat+image   # optional (default chat)
+PROVIDER_<ID>_LABEL=Friendly Name          # optional
+```
+
+Env-declared providers override built-ins of the same id and load **without a restart**.
+
+## Secrets — precedence & the `.local.env` safety net
+
+Resolution order (highest first): **process env → `.local.env` (project) → `~/.config/nexus/secrets/nexus.env` (global) → legacy `pollinations.key`**.
+
+`.local.env` is auto-discovered (CWD, script dir, web-root's parent) or set with `--env`. The
+server protects it three ways: it's **never web-served** (the static handler 404s any
+`.env`/`.key`/`.pem`/dotfile, even inside the root), **never git-committed** (on startup it
+appends the secret patterns to a `.gitignore` in that folder — append-only, idempotent), and
+**never logged or returned** (`/api/providers` exposes only `key_present` booleans). Copy
+`.local.env.example` → `.local.env`, then `chmod 600`.
 
 ## Using it from another app (e.g. OpenCharacters)
 
