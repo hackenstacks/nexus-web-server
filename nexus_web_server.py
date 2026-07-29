@@ -25,6 +25,8 @@ Routes:
   POST /api/llm/{provider}/v1/chat/completions  same, but VANILLA OpenAI body
                                                (provider in URL — for OpenCharacters &
                                                any "custom endpoint" client)
+  GET  /api/apps                               list sub-apps in ROOT (for manager UI)
+  POST /api/wire                               run nexus-proxy-wire.sh on a given dir
   *                                            static file under ROOT (SPA fallback)
 
 Usage:
@@ -275,6 +277,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._provider_models(path.rsplit("/", 1)[-1])
         if path == "/api/pollinations/image":
             return self._pollinations_image()
+        if path == "/api/apps":
+            return self._list_apps()
         if path.startswith("/api/"):
             return self._json({"error": f"unknown API route {path}"}, 404)
         return self._serve_static(path)
@@ -286,6 +290,8 @@ class Handler(BaseHTTPRequestHandler):
         m = LLM_PATH_RE.match(path)
         if m:
             return self._llm_proxy(provider_from_url=m.group(1))
+        if path == "/api/wire":
+            return self._wire_app()
         return self._json({"error": f"unknown API route {path}"}, 404)
 
     def do_OPTIONS(self):
@@ -410,6 +416,71 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{prov['label']} {e.code}", "detail": e.read()[:500].decode("utf-8", "replace")}, e.code)
         except Exception as e:
             self._json({"error": "Upstream request failed", "detail": str(e)[:300]}, 502)
+
+    # ── manager API ───────────────────────────────────────────────────────────
+
+    def _list_apps(self):
+        """GET /api/apps — list sub-apps in ROOT."""
+        import stat as _stat
+        apps = []
+        try:
+            for entry in sorted(ROOT.iterdir(), key=lambda p: p.name.lower()):
+                if entry.name.startswith("."):
+                    continue
+                resolved = entry.resolve()
+                is_dir   = resolved.is_dir()
+                idx      = (resolved / "index.html").is_file() if is_dir else False
+                apps.append({
+                    "name":       entry.name,
+                    "path":       str(resolved),
+                    "symlink":    entry.is_symlink(),
+                    "has_index":  idx,
+                    "url":        f"/{entry.name}/",
+                })
+        except Exception as e:
+            return self._json({"error": str(e)}, 500)
+        self._json({"apps": apps, "root": str(ROOT)})
+
+    def _wire_app(self):
+        """POST /api/wire — run nexus-proxy-wire.sh on a given directory."""
+        import subprocess, shlex
+        try:
+            length  = int(self.headers.get("Content-Length", 0))
+            body    = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            return self._json({"error": "invalid JSON body"}, 400)
+
+        app_path = body.get("path", "").strip()
+        app_name = body.get("name", "").strip()
+
+        # Validate path — must be absolute existing directory
+        if not app_path or not os.path.isabs(app_path):
+            return self._json({"error": "path must be an absolute directory path"}, 400)
+        if not os.path.isdir(app_path):
+            return self._json({"error": f"not a directory: {app_path}"}, 400)
+
+        # Validate name — alphanumeric + dash only (prevents shell injection)
+        if app_name and not re.match(r'^[a-z0-9][a-z0-9\-]{0,63}$', app_name):
+            return self._json({"error": "name must be lowercase alphanumeric + dash"}, 400)
+
+        wire = Path.home() / "scripts" / "nexus-proxy-wire.sh"
+        if not wire.is_file():
+            return self._json({"error": f"wire script not found: {wire}"}, 500)
+
+        cmd = [str(wire), app_path] + ([app_name] if app_name else [])
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            output = result.stdout + result.stderr
+            self._json({
+                "success":    result.returncode == 0,
+                "output":     output,
+                "returncode": result.returncode,
+                "name":       app_name or os.path.basename(app_path).lower(),
+            })
+        except subprocess.TimeoutExpired:
+            self._json({"error": "wire timed out (180 s) — npm install may be slow", "output": ""}, 504)
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
 
     # ── static files with per-app SPA fallback ────────────────────────────────
     def _resolve(self, path):

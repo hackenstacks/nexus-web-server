@@ -60,3 +60,61 @@ Testing: mistral 60, groq 15, google 57, cerebras 3, deepseek 2, pollinations 15
 
 ---
 
+
+## Multi-app web root: chargen + foundry + oc under ~/nexus-web/ (2026-07-29 00:25)
+
+**Status:** ✅ TESTED — all three apps serve 200, proxy 13 providers ready
+
+**What:** Extended the NeXuS Web Server to serve multiple apps from one HTTPS port via a `~/nexus-web/` root with symlinked app sub-directories.
+
+**Why:** Single port, single cert, single key injection point — add an app with one symlink, no config or server restart needed.
+
+**How:**
+- Created `~/nexus-web/` with three symlinks: `chargen → adv-ai-nexus/.../dist`, `foundry → NeXuS-AI-Foundry-v-9 - 1/dist`, `oc → OpenCharacters-0.0.5/`
+- Fixed server traversal check: `_resolve()` was calling `.resolve()` (follows symlinks) BEFORE the ROOT containment check, so symlinks outside ROOT were blocked. Fix: use `os.path.normpath` for containment (catches `../` traversal without following symlinks), then `.resolve()` after for actual file ops.
+- Added `base: './'` to both vite configs (foundry + chargen) so asset URLs are relative and work from any subpath.
+- Wired NeXuS-AI-Foundry-v-9 with `nexusProxy.ts` interceptor: copied to `services/`, installed in `index.tsx` before React mount.
+- Updated `nexus-api-proxy.sh` ROOT from chargen/dist to `$HOME/nexus-web`.
+
+**Files:**
+- `~/Projects/nexus-web-server/nexus_web_server.py` — symlink fix in `_resolve()` (fossil ea1509a9)
+- `~/Projects/NeXuS-AI-Foundry-v-9 - 1/services/nexusProxy.ts` — new
+- `~/Projects/NeXuS-AI-Foundry-v-9 - 1/index.tsx` — installNexusProxy() first
+- `~/Projects/NeXuS-AI-Foundry-v-9 - 1/vite.config.ts` — base: './'
+- `~/Projects/adv-ai-nexus/.../vite.config.ts` — base: './' (fossil 7cdb1eed)
+- `~/scripts/nexus-api-proxy.sh` — ROOT=~/nexus-web
+- `~/nexus-web/` — new root dir with chargen/, foundry/, oc/ symlinks
+
+**Testing:** curl confirmed 200 for /, /chargen/, /foundry/, /oc/play.html, /api/health. 13 providers ready.
+
+**URLs:**
+- https://localhost:8443/ — landing page (lists all apps)
+- https://localhost:8443/chargen/ — char-gen (A.I.M.E home)
+- https://localhost:8443/foundry/ — NeXuS-AI-Foundry (de-googled, proxy-wired)
+- https://localhost:8443/oc/play.html — OpenCharacters
+
+---
+
+
+## Foundry Settings: proxy-driven provider dropdowns (2026-07-29 00:55)
+
+**Status:** ✅ TESTED — builds clean, served at /foundry/, GitHub pushed
+
+**What:** NeXuS-AI-Foundry Settings page now auto-populates provider dropdowns from the proxy, with a Custom fallback for any unlisted endpoint.
+
+**Why:** Unified the foundry with the same sovereign key model as char-gen — no API keys in the browser, no hardcoded provider lists.
+
+**How:**
+- On mount: GET /api/providers → if online, populate dropdown with ✓/○ providers; if offline, show badge + custom fields
+- Per feature: select proxy provider → endpoint auto-set to /api/llm/{id}/v1/chat/completions, models auto-fetched from /api/models/provider/{id}, key fields hidden, info line shows wired endpoint
+- Custom / Unlisted option: shows endpoint text input + API key input (manual entry, works without proxy)
+- Nothing selected / proxy offline: custom fields always visible so the app works standalone
+- Proxy status badge in section header: ⚡ proxy live / ○ proxy offline / … connecting
+- selectedProvider state initialised from saved endpoint URLs on load (regex /api/llm/{id}/ → detects proxy providers, else → 'custom')
+
+**Files:**
+- ~/Projects/NeXuS-AI-Foundry-v-9 - 1/features/Settings.tsx
+**Fossil:** 9f3c8bd8 | **GitHub:** hackenstacks/nexus-ai-foundry (private, main branch)
+
+---
+
