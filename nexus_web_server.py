@@ -415,13 +415,17 @@ class Handler(BaseHTTPRequestHandler):
     def _resolve(self, path):
         """Map a URL path to a file under ROOT. Returns (Path|None, is_spa_fallback)."""
         rel = urllib.parse.unquote(path).lstrip("/")
-        target = (ROOT / rel).resolve()
-        root_r = ROOT.resolve()
-        if not (target == root_r or str(target).startswith(str(root_r) + os.sep)):
+        # Containment check uses normpath (no symlink follow) so symlinked sub-apps are allowed.
+        # Traversal (../../etc) is caught because normpath collapses the segments.
+        root_r   = ROOT.resolve()
+        norm     = Path(os.path.normpath(ROOT / rel))
+        if not (norm == ROOT or str(norm).startswith(str(ROOT) + os.sep)):
             return None, False                       # traversal blocked
+        # Resolve after containment check — now safe to follow symlinks into the real target.
+        target = norm.resolve()
         # never serve secrets/dotfiles — even if one sits inside the web root
         if any(seg.startswith(".") and seg not in (".well-known",) for seg in rel.split("/") if seg) \
-           or is_secret_path(target):
+           or is_secret_path(norm):
             return None, False
         if target.is_dir():
             idx = target / "index.html"
