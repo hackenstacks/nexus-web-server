@@ -118,3 +118,60 @@ Testing: mistral 60, groq 15, google 57, cerebras 3, deepseek 2, pollinations 15
 
 ---
 
+
+## Wire script + Manager UI dashboard (2026-07-29 01:12)
+
+**Status:** ✅ TESTED — /api/apps lists 5 apps, /manager/ serves 200, wire script executable
+
+**What:** Three new components that bring all proxy-managed apps together under one control surface.
+
+**nexus-proxy-wire.sh** (~120 lines, ~/scripts/):
+- Detects app type: vite+react (has vite.config.ts) vs static HTML vs unknown
+- Vite+React: copies nexusProxy.ts, patches index.tsx (installNexusProxy before React), adds base: './' to vite.config, npm installs if needed, builds, symlinks dist/ to ~/nexus-web/<name>/
+- Static: symlinks dir directly
+- Idempotent — re-run safe, skips already-done steps
+- Python used for patching (regex insert, not fragile awk/sed)
+
+**nexus_web_server.py additions:**
+- GET /api/apps — lists ROOT subdirs: {name, path, symlink, has_index, url}
+- POST /api/wire — validates path (absolute, must be dir) + name (alphanum+dash), runs wire script, returns {success, output, returncode}; 180s timeout; input sanitized (no shell injection)
+
+**~/nexus-web/manager/index.html** (pure HTML/CSS/JS, no build):
+- Dark NeXuS theme, sticky header with proxy status badge (live/offline/connecting)
+- Providers section: card grid from /api/providers showing ✓ ready / ○ no key
+- Apps section: card grid from /api/apps with name, url, path, live status, Open ↗ link; filters out manager itself
+- Wire panel: path + name inputs, Wire button → POST /api/wire → terminal-style console output; auto-refresh apps list on success
+- Auto-refreshes every 30s; strips ANSI codes from wire output
+
+**Files:**
+- ~/scripts/nexus-proxy-wire.sh (new, chmod +x)
+- ~/Projects/nexus-web-server/nexus_web_server.py (fossil ed15fd48)
+- ~/nexus-web/manager/index.html (new)
+
+**URLs:**
+- https://localhost:8443/manager/ — the dashboard
+- https://localhost:8443/api/apps — app list JSON
+- POST https://localhost:8443/api/wire — trigger wire script
+
+---
+
+
+## Session wrap: ai-forge Code Review mode + all apps live (2026-07-29 02:10)
+
+**Status:** ✅ TESTED (proxy/manager/apps) | 🔵 DESIGNED (forge code review — built, needs Mistral test)
+
+**What:** Full proxy layer operational. 5 apps at :8443. ai-forge rebuilt with proxy settings + structured Code Review mode.
+
+**Files changed this session:**
+- ~/Projects/nexus-web-server/nexus_web_server.py
+- ~/nexus-web/manager/index.html
+- ~/scripts/nexus-proxy-wire.sh
+- ~/Projects/ai-forge/components/{CodeInput,ReviewOutput,SettingsModal,ChatView,Header}.tsx
+- ~/Projects/ai-forge/services/llmService.ts
+- ~/Projects/ai-forge/App.tsx
+- ~/Projects/NeXuS-AI-Foundry-v-9 - 1/features/Settings.tsx
+
+**Tomorrow:** Test Code Review with Mistral, confirm workspace injection, archive beta dir
+
+---
+

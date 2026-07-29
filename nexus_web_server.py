@@ -81,10 +81,13 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
     "Content-Security-Policy": (
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-        "worker-src 'self' blob:; child-src 'self' blob:; "          # web workers load from blob:
-        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; "
-        "connect-src 'self' https: http://localhost:*; font-src 'self' data:;"
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://esm.sh https://cdn.jsdelivr.net https://unpkg.com; "
+        "worker-src 'self' blob:; child-src 'self' blob:; "
+        "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob: https:; "
+        "connect-src 'self' https: http://localhost:*; "
+        "font-src 'self' data: https://fonts.gstatic.com https://esm.sh;"
     ),
 }
 
@@ -316,9 +319,20 @@ class Handler(BaseHTTPRequestHandler):
         prov = discover_providers().get(pid or "")
         if not prov:
             return self._json({"error": f"unknown provider '{pid}'"}, 404)
-        # Pollinations exposes richer text/image lists; use them.
+        # Pollinations text models — normalize to same {provider, models} shape.
         if pid == "pollinations":
-            return self._passthrough(f"{POLLI_BASE}/text/models")
+            try:
+                req = urllib.request.Request(f"{POLLI_BASE}/text/models", headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=20) as up:
+                    raw = json.loads(up.read() or b"[]")
+                rows = raw if isinstance(raw, list) else raw.get("data", [])
+                ids = sorted(set(
+                    r.get("name") or r.get("id") or ""
+                    for r in rows if isinstance(r, dict)
+                ) - {""})
+                return self._json({"provider": "pollinations", "models": ids})
+            except Exception as e:
+                return self._json({"provider": "pollinations", "models": [], "error": str(e)[:200]})
         base = prov["base_url"].rstrip("/")
         headers = {"User-Agent": UA}
         if prov["requires_key"]:
