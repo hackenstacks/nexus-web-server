@@ -117,6 +117,10 @@ POLLI_BASE = "https://gen.pollinations.ai"
 UA = "nexus-web-server"
 LLM_PATH_RE = re.compile(r"^/api/llm/([A-Za-z0-9_.-]+)/(?:v1/)?chat/completions/?$")
 
+# ── Charcard backend (nexus_png2_editor.py Flask app) ────────────────────────
+CHARCARD_BACKEND = os.environ.get("CHARCARD_URL", "http://127.0.0.1:7420")
+CHARCARD_PREFIX  = "/charcard"
+
 
 PROVIDER_RE = re.compile(r"^PROVIDER_([A-Za-z0-9]+)_BASE_URL$")
 
@@ -284,6 +288,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._list_apps()
         if path.startswith("/api/"):
             return self._json({"error": f"unknown API route {path}"}, 404)
+        if path.startswith(CHARCARD_PREFIX):
+            return self._charcard_proxy()
         return self._serve_static(path)
 
     def do_POST(self):
@@ -295,6 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._llm_proxy(provider_from_url=m.group(1))
         if path == "/api/wire":
             return self._wire_app()
+        if path.startswith(CHARCARD_PREFIX):
+            return self._charcard_proxy()
         return self._json({"error": f"unknown API route {path}"}, 404)
 
     def do_OPTIONS(self):
@@ -495,6 +503,57 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "wire timed out (180 s) — npm install may be slow", "output": ""}, 504)
         except Exception as e:
             self._json({"error": str(e)}, 500)
+
+    # ── charcard reverse proxy ────────────────────────────────────────────────
+    def _charcard_proxy(self):
+        """Reverse-proxy /charcard/* → Flask PNG² editor at CHARCARD_BACKEND.
+        Rewrites absolute paths in HTML responses so /thumb/, /card/, etc. work
+        through the proxy prefix instead of resolving at the root."""
+        parsed   = urllib.parse.urlparse(self.path)
+        subpath  = parsed.path[len(CHARCARD_PREFIX):] or "/"
+        target   = CHARCARD_BACKEND + subpath
+        if parsed.query:
+            target += "?" + parsed.query
+
+        method      = self.command
+        content_len = int(self.headers.get("Content-Length", 0) or 0)
+        body        = self.rfile.read(content_len) if content_len > 0 else None
+
+        req = urllib.request.Request(target, data=body, method=method)
+        for h in ("Content-Type", "Accept", "X-Requested-With"):
+            v = self.headers.get(h)
+            if v:
+                req.add_header(h, v)
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data  = resp.read()
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                if "text/html" in ctype:
+                    html = data.decode("utf-8", errors="replace")
+                    for old, new in [
+                        ('src="/thumb/',      f'src="{CHARCARD_PREFIX}/thumb/'),
+                        ("src='/thumb/",      f"src='{CHARCARD_PREFIX}/thumb/"),
+                        ("'/thumb/' +",       f"'{CHARCARD_PREFIX}/thumb/' +"),
+                        ('"/thumb/" +',       f'"{CHARCARD_PREFIX}/thumb/" +'),
+                        ("fetch('/card/",     f"fetch('{CHARCARD_PREFIX}/card/"),
+                        ('fetch("/card/',     f'fetch("{CHARCARD_PREFIX}/card/'),
+                        ("fetch('/save/",     f"fetch('{CHARCARD_PREFIX}/save/"),
+                        ('fetch("/save/',     f'fetch("{CHARCARD_PREFIX}/save/'),
+                        ("fetch('/export/",   f"fetch('{CHARCARD_PREFIX}/export/"),
+                        ('fetch("/export/',   f'fetch("{CHARCARD_PREFIX}/export/'),
+                    ]:
+                        html = html.replace(old, new)
+                    data = html.encode("utf-8")
+                self._send(resp.status, ctype, {"Content-Length": str(len(data))})
+                self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            data  = e.read()
+            ctype = e.headers.get("Content-Type", "text/html")
+            self._send(e.code, ctype, {"Content-Length": str(len(data))})
+            self.wfile.write(data)
+        except Exception as e:
+            self._json({"error": f"charcard backend unreachable — start PNG² editor first ({e})"}, 502)
 
     # ── static files with per-app SPA fallback ────────────────────────────────
     def _resolve(self, path):
