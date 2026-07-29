@@ -80,6 +80,7 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
     "Content-Security-Policy": (
         "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        "worker-src 'self' blob:; child-src 'self' blob:; "          # web workers load from blob:
         "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; "
         "connect-src 'self' https: http://localhost:*; font-src 'self' data:;"
     ),
@@ -270,6 +271,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._passthrough(f"{POLLI_BASE}/image/models")
         if path == "/api/models/text":
             return self._passthrough(f"{POLLI_BASE}/text/models")
+        if path.startswith("/api/models/provider/"):
+            return self._provider_models(path.rsplit("/", 1)[-1])
         if path == "/api/pollinations/image":
             return self._pollinations_image()
         if path.startswith("/api/"):
@@ -301,6 +304,36 @@ class Handler(BaseHTTPRequestHandler):
                            "dynamic": p.get("dynamic", False), "proxied": True}
                      for pid, p in provs.items()}
         return {"providers": providers, "defaults": DEFAULTS}
+
+    # ── live per-provider model list (any provider's /models, normalized) ─────
+    def _provider_models(self, pid):
+        prov = discover_providers().get(pid or "")
+        if not prov:
+            return self._json({"error": f"unknown provider '{pid}'"}, 404)
+        # Pollinations exposes richer text/image lists; use them.
+        if pid == "pollinations":
+            return self._passthrough(f"{POLLI_BASE}/text/models")
+        base = prov["base_url"].rstrip("/")
+        headers = {"User-Agent": UA}
+        if prov["requires_key"]:
+            key = load_secret(prov["key_env"])
+            if not key:
+                return self._json({"models": [], "error": f"{prov['label']} has no key"}, 200)
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            req = urllib.request.Request(f"{base}/models", headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as up:
+                raw = json.loads(up.read() or b"{}")
+        except Exception as e:
+            return self._json({"models": [], "error": str(e)[:200]}, 200)
+        # OpenAI shape {data:[{id}]}; some return a bare list.
+        rows = raw.get("data", raw) if isinstance(raw, dict) else raw
+        ids = []
+        for r in rows if isinstance(rows, list) else []:
+            mid = r.get("id") or r.get("name") if isinstance(r, dict) else (r if isinstance(r, str) else None)
+            if mid:
+                ids.append(mid)
+        return self._json({"provider": pid, "models": sorted(set(ids))})
 
     # ── keyless passthrough (model lists) ─────────────────────────────────────
     def _passthrough(self, url):

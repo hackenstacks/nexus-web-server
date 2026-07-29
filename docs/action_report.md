@@ -24,3 +24,39 @@ Dependencies: python3 (3.14 here; needs 3.8+ for walrus); cert.pem/key.pem (self
 
 ---
 
+
+## Universal API server: dynamic providers + per-provider live models + secure .local.env (2026-07-28 21:52)
+
+Status: ✅ TESTED (server); 🔵 in-progress (browser UI B)
+
+What: Grew NeXuS Web Server into a universal API server. Env-declared providers (PROVIDER_<ID>_BASE_URL/_API_KEY/_KIND/_LABEL) register on the fly; added /api/models/provider/{id} for live per-provider model lists; layered secure .local.env (precedence, never-served, auto-.gitignore, chmod-600 warn); CSP worker-src blob: fix.
+
+Why: One sovereign egress for ALL providers, keys server-side, and 'drop a provider in the env file' — no code. Feeds the app's fresh-models + provider-dropdown goal (B).
+
+How: discover_providers() merges built-ins + env scan; _provider_models() GETs {base_url}/models with injected key and normalizes ids. load_secret() precedence process-env>.local.env>nexus.env>legacy. is_secret_path() denylist for static. ensure_gitignore() append-only on startup.
+
+Files: nexus_web_server.py (EDITED, models endpoint + CSP UNCOMMITTED; .local.env + dynamic committed 2783886d0b), .local.env.example, docs/nexus-web-server_HELP.md (100% requirements), docs/action_report.md.
+
+Testing: 12 providers READY after loading Anon's keys; live /models mistral 60 / google 57 / cerebras 3 / deepseek 2 / pollinations 157; .local.env override + /.local.env 404 + auto-.gitignore verified; dynamic myllm/opengw earlier.
+
+Dependencies: python3>=3.8 stdlib only; cert/key; nexus.env/.local.env for keyed providers.
+
+---
+
+
+## Added /api/models/provider/{id} + HELP route (2026-07-28 22:29)
+
+Status: ✅ TESTED
+
+What: New GET /api/models/provider/{id} returns live /models for ANY provider (normalized ids), powering the app's server-driven model dropdowns. HELP routes table updated.
+
+Why: 'Fresh API models' per provider, not just Pollinations.
+
+How: _provider_models() looks up base_url+key, GETs {base_url}/models, normalizes {data:[{id}]}/bare-list. Pollinations delegates to /text/models.
+
+Files: nexus_web_server.py (UNCOMMITTED), docs/nexus-web-server_HELP.md.
+
+Testing: mistral 60, groq 15, google 57, cerebras 3, deepseek 2, pollinations 157.
+
+---
+
