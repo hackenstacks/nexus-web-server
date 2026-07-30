@@ -588,11 +588,17 @@ class Handler(BaseHTTPRequestHandler):
                 return cand, True
         return None, False
 
-    # Script injected into OpenCharacters HTML to intercept API calls → proxy
+    # Script injected into OpenCharacters HTML.
+    # 1. Fetch interceptor — rewrites AI provider URLs to same-origin proxy, strips auth header.
+    # 2. DB seeder — writes a dummy API key + nexus proxy model configs into OC's IndexedDB
+    #    so OC's client-side "no key → skip" gate passes. Runs after a short delay to let
+    #    OC create the DB schema first; idempotent (skips if already configured).
     _OC_INJECT = (
-        '<script>/* NeXuS proxy — routes AI calls through local key-injecting proxy */\n'
+        '<script>/* NeXuS proxy auto-config for OpenCharacters */\n'
         '(function(){\n'
         '  var BASE=window.location.origin;\n'
+        '\n'
+        '  /* 1 ── fetch interceptor */\n'
         '  var MAP={\n'
         '    "api.openai.com":  BASE+"/api/llm/openai/v1",\n'
         '    "api.mistral.ai":  BASE+"/api/llm/mistral/v1",\n'
@@ -616,6 +622,47 @@ class Handler(BaseHTTPRequestHandler):
         '    }\n'
         '    return _f(url,opts);\n'
         '  };\n'
+        '\n'
+        '  /* 2 ── seed IndexedDB after OC has had time to create the schema */\n'
+        '  function seedDB(){\n'
+        '    var req=indexedDB.open("chatbot-ui-v1");\n'
+        '    req.onerror=function(){};\n'
+        '    req.onsuccess=function(e){\n'
+        '      var db=e.target.result;\n'
+        '      if(!db.objectStoreNames.contains("misc")){db.close();return;}\n'
+        '      var tx=db.transaction("misc","readwrite");\n'
+        '      var st=tx.objectStore("misc");\n'
+        '      /* dummy API key so OC\'s client-side gate passes */\n'
+        '      var kr=st.get("openAiApiKey");\n'
+        '      kr.onsuccess=function(e){\n'
+        '        if(!e.target.result||!e.target.result.value)\n'
+        '          st.put({key:"openAiApiKey",value:"nexus-proxy"});\n'
+        '      };\n'
+        '      /* proxy model configs — only if user hasn\'t set any */\n'
+        '      var cr=st.get("customModelConfigs");\n'
+        '      cr.onsuccess=function(e){\n'
+        '        if(e.target.result&&e.target.result.value)return;\n'
+        '        var cfgs=[\n'
+        '          \'{ name:"nexus-mistral",shortLabel:"NeXuS · Mistral",\'\n'
+        '          +\'endpointUrl:"\'+BASE+\'/api/llm/mistral/v1/chat/completions",\'\n'
+        '          +\'apiKey:"nexus-proxy",maxSequenceLength:32768,\'\n'
+        '          +\'type:"chat-completion",tokenPricing:{prompt:0,completion:0} }\',\n'
+        '          \'{ name:"nexus-groq",shortLabel:"NeXuS · Groq",\'\n'
+        '          +\'endpointUrl:"\'+BASE+\'/api/llm/groq/v1/chat/completions",\'\n'
+        '          +\'apiKey:"nexus-proxy",maxSequenceLength:32768,\'\n'
+        '          +\'type:"chat-completion",tokenPricing:{prompt:0,completion:0} }\',\n'
+        '          \'{ name:"nexus-openai",shortLabel:"NeXuS · OpenAI",\'\n'
+        '          +\'endpointUrl:"\'+BASE+\'/api/llm/openai/v1/chat/completions",\'\n'
+        '          +\'apiKey:"nexus-proxy",maxSequenceLength:128000,\'\n'
+        '          +\'type:"chat-completion",tokenPricing:{prompt:0,completion:0} }\',\n'
+        '        ].join("\\n");\n'
+        '        st.put({key:"customModelConfigs",value:cfgs});\n'
+        '      };\n'
+        '      tx.oncomplete=function(){db.close();};\n'
+        '    };\n'
+        '  }\n'
+        '  /* delay so OC can create the DB schema first */\n'
+        '  setTimeout(seedDB,1500);\n'
         '})();\n'
         '</script>'
     )
