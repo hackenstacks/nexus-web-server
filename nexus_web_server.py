@@ -631,6 +631,13 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return self._json({"error": "500"}, 500)
         ctype = MIME_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        # Extensionless files — sniff first bytes to detect JavaScript bundles
+        if not target.suffix and ctype == "application/octet-stream":
+            peek = data[:300]
+            js_sigs = (b"(function", b"!function", b"var ", b"let ", b"const ",
+                       b'"use strict"', b"'use strict'", b"//", b"/*", b"export ")
+            if any(peek.lstrip().startswith(s) for s in js_sigs):
+                ctype = "application/javascript"
         # Inject fetch interceptor into OpenCharacters HTML so API calls route through proxy
         if path.startswith("/oc/") and "html" in ctype:
             html_str = data.decode("utf-8", errors="replace")
