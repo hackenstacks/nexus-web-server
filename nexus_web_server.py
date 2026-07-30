@@ -82,12 +82,12 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
     "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://esm.sh https://cdn.jsdelivr.net https://unpkg.com; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://esm.sh https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; "
         "worker-src 'self' blob:; child-src 'self' blob:; "
-        "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://fonts.googleapis.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
         "img-src 'self' data: blob: https:; "
         "connect-src 'self' https: http://localhost:*; "
-        "font-src 'self' data: https://fonts.gstatic.com https://esm.sh;"
+        "font-src 'self' data: https://fonts.gstatic.com https://esm.sh https://cdnjs.cloudflare.com;"
     ),
 }
 
@@ -290,6 +290,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": f"unknown API route {path}"}, 404)
         if path.startswith(CHARCARD_PREFIX):
             return self._charcard_proxy()
+        if path in ("/oc/", "/oc/index.html"):
+            self._send(302, "text/plain", {"Location": "/oc/play.html"})
+            return
         return self._serve_static(path)
 
     def do_POST(self):
@@ -585,6 +588,38 @@ class Handler(BaseHTTPRequestHandler):
                 return cand, True
         return None, False
 
+    # Script injected into OpenCharacters HTML to intercept API calls → proxy
+    _OC_INJECT = (
+        '<script>/* NeXuS proxy — routes AI calls through local key-injecting proxy */\n'
+        '(function(){\n'
+        '  var BASE=window.location.origin;\n'
+        '  var MAP={\n'
+        '    "api.openai.com":  BASE+"/api/llm/openai/v1",\n'
+        '    "api.mistral.ai":  BASE+"/api/llm/mistral/v1",\n'
+        '    "api.groq.com":    BASE+"/api/llm/groq/v1",\n'
+        '    "openrouter.ai":   BASE+"/api/llm/openrouter/v1",\n'
+        '    "aihorde.net":     BASE+"/api/llm/aihorde/v1",\n'
+        '  };\n'
+        '  var _f=window.fetch.bind(window);\n'
+        '  window.fetch=async function(url,opts){\n'
+        '    if(typeof url==="string"){\n'
+        '      for(var host in MAP){\n'
+        '        if(url.indexOf(host)!==-1){\n'
+        '          url=MAP[host]+url.replace(/^https?:\\/\\/[^\\/]+/,"");\n'
+        '          opts=Object.assign({},opts||{});\n'
+        '          opts.headers=Object.assign({},opts.headers||{});\n'
+        '          delete opts.headers["Authorization"];\n'
+        '          delete opts.headers["authorization"];\n'
+        '          break;\n'
+        '        }\n'
+        '      }\n'
+        '    }\n'
+        '    return _f(url,opts);\n'
+        '  };\n'
+        '})();\n'
+        '</script>'
+    )
+
     def _serve_static(self, path):
         target, _spa = self._resolve(path)
         if target is None:
@@ -595,7 +630,12 @@ class Handler(BaseHTTPRequestHandler):
             data = target.read_bytes()
         except OSError:
             return self._json({"error": "500"}, 500)
-        self._bytes(data, MIME_TYPES.get(target.suffix.lower(), "application/octet-stream"))
+        ctype = MIME_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        # Inject fetch interceptor into OpenCharacters HTML so API calls route through proxy
+        if path.startswith("/oc/") and "html" in ctype:
+            html_str = data.decode("utf-8", errors="replace")
+            data = html_str.replace("<head>", "<head>\n" + self._OC_INJECT, 1).encode("utf-8")
+        self._bytes(data, ctype)
 
     def _landing(self, directory, path):
         """Minimal 'drop a folder in' index: list subfolders/apps under this dir."""
