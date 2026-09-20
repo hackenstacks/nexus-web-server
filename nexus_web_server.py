@@ -113,10 +113,15 @@ PROVIDERS = {
                      "key_env": None,                   "requires_key": False, "kind": "chat"},
     "ollama":       {"label": "Ollama (local)",    "base_url": "http://localhost:11434/v1",
                      "key_env": None,                   "requires_key": False, "kind": "chat"},
-    "aihorde":      {"label": "AI Horde (keyless)","base_url": "https://aihorde.net/api/v2",
-                     "key_env": None,                   "requires_key": False, "kind": "chat+image"},
+    "aihorde":      {"label": "AI Horde (free)",  "base_url": "https://aihorde.net/api/v2",
+                     "key_env": "AIHORDE_API_KEY",      "requires_key": False, "kind": "chat+image",
+                     "async_horde": True},
 }
-DEFAULTS = {"main": "aihorde", "image": "pollinations", "embedding": "local"}
+# Free AI Horde is the default for BOTH text and image (sovereign, keyless).
+# Media types resolve through different mechanisms: text/image = HTTP providers,
+# audio = local piper TTS engine, video = go2rtc camera/encode source.
+DEFAULTS = {"main": "aihorde", "text": "aihorde", "image": "aihorde",
+            "audio": "piper", "video": "go2rtc", "embedding": "local"}
 
 POLLI_BASE = "https://gen.pollinations.ai"
 UA = "nexus-web-server"
@@ -588,6 +593,9 @@ class Handler(BaseHTTPRequestHandler):
         prov = provs.get(pid or "")
         if not prov:
             return self._json({"error": f"unknown provider '{pid}'", "known": list(provs)}, 400)
+        # AI Horde speaks its own async API, not OpenAI — dedicated handler.
+        if prov.get("async_horde"):
+            return self._horde_text(payload)
         base = (payload.pop("base_url", None) or prov["base_url"]).rstrip("/")
         url = f"{base}/chat/completions"
         headers = {"Content-Type": "application/json", "User-Agent": UA}
@@ -632,6 +640,106 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{prov['label']} {e.code}", "detail": e.read()[:500].decode("utf-8", "replace")}, e.code)
         except Exception as e:
             self._json({"error": "Upstream request failed", "detail": str(e)[:300]}, 502)
+
+    # ── AI Horde (free, sovereign default) — async submit→poll ──────────────────
+    # Anonymous key "0000000000" works (low priority). Set AIHORDE_API_KEY for a
+    # registered account = faster kudos-priority. Server is threaded, so a bounded
+    # blocking poll here doesn't stall other clients.
+
+    _HORDE_BASE = "https://aihorde.net/api/v2"
+
+    def _horde_key(self):
+        return load_secret("AIHORDE_API_KEY") or "0000000000"
+
+    def _horde_req(self, path, data=None, method="GET"):
+        body = json.dumps(data).encode() if data is not None else None
+        req = urllib.request.Request(self._HORDE_BASE + path, data=body, method=method,
+            headers={"apikey": self._horde_key(), "Content-Type": "application/json",
+                     "User-Agent": UA, "Client-Agent": "nexus-studio:1.0:nxsnet"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+
+    def _horde_text(self, payload):
+        """OpenAI-shaped chat → Horde text async → OpenAI-shaped completion."""
+        import time as _t
+        msgs = payload.get("messages", [])
+        prompt = "\n".join(f"{m.get('role','user')}: {m.get('content','')}" for m in msgs)
+        prompt += "\nassistant:"
+        want = payload.get("model") or ""
+        req = {"prompt": prompt,
+               "params": {"max_length": int(payload.get("max_tokens", 320)),
+                          "max_context_length": 2048},
+               "models": [want] if want and want != "default" else []}
+        try:
+            sub = self._horde_req("/generate/text/async", req, "POST")
+        except urllib.error.HTTPError as e:
+            return self._json({"error": "AI Horde rejected request",
+                               "detail": e.read()[:300].decode("utf-8", "replace")}, 502)
+        except Exception as e:
+            return self._json({"error": f"AI Horde unreachable: {e}"}, 502)
+        jid = sub.get("id")
+        if not jid:
+            return self._json({"error": "AI Horde: no job id", "detail": str(sub)[:200]}, 502)
+        deadline = _t.time() + 90          # bounded — anon queue can be long
+        text = None
+        while _t.time() < deadline:
+            _t.sleep(2)
+            try:
+                st = self._horde_req(f"/generate/text/status/{jid}")
+            except Exception:
+                continue
+            if st.get("done"):
+                gens = st.get("generations", [])
+                text = (gens[0].get("text", "") if gens else "").strip()
+                break
+            if st.get("faulted"):
+                return self._json({"error": "AI Horde job faulted"}, 502)
+        if text is None:
+            return self._json({"error": "AI Horde still cooking — anonymous queue is busy. "
+                               "Try again, or add AIHORDE_API_KEY for priority.",
+                               "job": jid}, 504)
+        return self._json({
+            "id": f"horde-{jid}", "object": "chat.completion", "model": "aihorde",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}],
+        })
+
+    def _horde_image(self, payload):
+        """Horde image async → {images:[data-uri...]}. Separate shape from chat."""
+        import time as _t, base64 as _b64
+        prompt = payload.get("prompt", "")
+        if not prompt.strip():
+            return self._json({"error": "prompt required"}, 400)
+        want = payload.get("model") or "stable_diffusion"
+        req = {"prompt": prompt,
+               "params": {"n": 1, "width": int(payload.get("width", 512)),
+                          "height": int(payload.get("height", 512)),
+                          "steps": int(payload.get("steps", 25))},
+               "models": [want] if want else [], "nsfw": bool(payload.get("nsfw", False))}
+        try:
+            sub = self._horde_req("/generate/async", req, "POST")
+        except Exception as e:
+            return self._json({"error": f"AI Horde image: {e}"}, 502)
+        jid = sub.get("id")
+        if not jid:
+            return self._json({"error": "AI Horde: no job id"}, 502)
+        deadline = _t.time() + 150         # image gen is slower than text
+        images = None
+        while _t.time() < deadline:
+            _t.sleep(3)
+            try:
+                st = self._horde_req(f"/generate/status/{jid}")
+            except Exception:
+                continue
+            if st.get("done"):
+                images = [g.get("img", "") for g in st.get("generations", [])]
+                break
+            if st.get("faulted"):
+                return self._json({"error": "AI Horde image faulted"}, 502)
+        if images is None:
+            return self._json({"error": "AI Horde image still cooking — try again or add a key.",
+                               "job": jid}, 504)
+        return self._json({"images": images, "model": "aihorde", "job": jid})
 
     # ── manager API ───────────────────────────────────────────────────────────
 
@@ -1653,6 +1761,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._aether_interview()
         if tail == "broadcast" and self.command == "POST":
             return self._aether_broadcast()
+        if tail == "cameras":
+            return self._aether_cameras()
+        if tail == "camera" and self.command == "POST":
+            return self._aether_camera_ctl()
+        if tail.startswith("camera-mjpeg"):
+            return self._aether_camera_mjpeg()
+        if tail == "image" and self.command == "POST":
+            length = int(self.headers.get("Content-Length", 0))
+            try: body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception: return self._json({"error": "bad json"}, 400)
+            # Default image provider is AI Horde (free). Others can be added later.
+            return self._horde_image(body)
         if tail.startswith("radio/") and self.command == "POST":
             return self._aether_radio(tail[len("radio/"):])
         if tail.startswith("network/") and self.command == "POST":
@@ -1738,6 +1858,81 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "nexus-aether-broadcast.sh not found"}, 503)
         rc, out = self._sh(["sh", self._AETHER_CAST_SH, action, net])
         return self._json({"ok": rc == 0, "network": net, "action": action, "output": out})
+
+    # ── Camera sources via go2rtc (phone / IP cam / Pi Zero → WebRTC hub) ───────
+
+    def _go2rtc_url(self):
+        return (load_secret("NEXUS_GO2RTC_URL") or "http://127.0.0.1:1984").rstrip("/")
+
+    def _aether_cameras(self):
+        """GET → go2rtc streams + status. Proxied so the HTTPS studio stays same-origin."""
+        base = self._go2rtc_url()
+        try:
+            with urllib.request.urlopen(base + "/api/streams", timeout=5) as r:
+                streams = json.loads(r.read())
+            names = list(streams.keys()) if isinstance(streams, dict) else []
+            return self._json({"up": True, "cameras": names, "go2rtc": base})
+        except Exception as e:
+            return self._json({"up": False, "cameras": [], "go2rtc": base,
+                               "error": f"go2rtc unreachable: {e}"})
+
+    def _aether_camera_ctl(self):
+        """POST {action:add|remove, name, src} → manage a go2rtc stream.
+        src/name go to go2rtc's HTTP API (not a shell) — injection-safe."""
+        import urllib.parse as _up
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self._json({"error": "bad json"}, 400)
+        action = body.get("action", "add")
+        name   = str(body.get("name", "")).strip()
+        base   = self._go2rtc_url()
+        if not name:
+            return self._json({"error": "name required"}, 400)
+        try:
+            if action == "add":
+                src = str(body.get("src", "")).strip()
+                if not src:
+                    return self._json({"error": "src required"}, 400)
+                q = _up.urlencode({"name": name, "src": src})
+                req = urllib.request.Request(f"{base}/api/streams?{q}", method="PUT")
+            elif action == "remove":
+                q = _up.urlencode({"src": name})
+                req = urllib.request.Request(f"{base}/api/streams?{q}", method="DELETE")
+            else:
+                return self._json({"error": f"bad action: {action}"}, 400)
+            with urllib.request.urlopen(req, timeout=8) as r:
+                r.read()
+            return self._json({"ok": True, "action": action, "name": name})
+        except Exception as e:
+            return self._json({"error": f"go2rtc: {e}"}, 502)
+
+    def _aether_camera_mjpeg(self):
+        """GET ?src=NAME → proxy go2rtc's MJPEG preview (same-origin HTTPS for the studio)."""
+        import urllib.parse as _up
+        qs  = _up.parse_qs(_up.urlparse(self.path).query)
+        src = qs.get("src", [""])[0]
+        if not src:
+            return self._json({"error": "src required"}, 400)
+        base = self._go2rtc_url()
+        url  = f"{base}/api/stream.mjpeg?{_up.urlencode({'src': src})}"
+        try:
+            up = urllib.request.urlopen(url, timeout=10)
+        except Exception as e:
+            return self._json({"error": f"go2rtc mjpeg: {e}"}, 502)
+        self.send_response(200)
+        self.send_header("Content-Type", up.headers.get("Content-Type", "multipart/x-mixed-replace"))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            while (chunk := up.read(8192)):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            up.close()
 
     # ── Forge Sessions — announce a live session to enabled networks ────────────
 
