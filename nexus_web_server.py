@@ -1677,17 +1677,20 @@ class Handler(BaseHTTPRequestHandler):
             finally: s.close()
         have_mpc = shutil.which("mpc") is not None
         now_playing, state, queue = "", "stopped", []
+        mpd_up = False
         if have_mpc:
-            _, cur = self._sh(["mpc", "current"], timeout=4); now_playing = cur
             rc, st = self._sh(["mpc", "status"], timeout=4)
-            if rc == 0 and st:
+            mpd_up = rc == 0 and "error" not in st.lower()
+            if mpd_up:
+                _, cur = self._sh(["mpc", "current"], timeout=4)
+                now_playing = cur if "error" not in cur.lower() else ""
                 import re as _re
                 m = _re.search(r"\[(\w+)\]", st); state = m.group(1) if m else "stopped"
-            _, pl = self._sh(["mpc", "playlist"], timeout=4)
-            queue = [l for l in pl.splitlines() if l][:30]
+                _, pl = self._sh(["mpc", "playlist"], timeout=4)
+                queue = [l for l in pl.splitlines() if l and "error" not in l.lower()][:30]
         return self._json({
             "stream_url":  load_secret("NEXUS_RADIO_STREAM") or "http://127.0.0.1:8000/nexus.ogg",
-            "mpd":         have_mpc and state != "stopped",
+            "mpd":         mpd_up,
             "mpd_installed": have_mpc,
             "icecast":     _port_up(int(load_secret("NEXUS_RADIO_PORT") or 8000)),
             "murmur":      _port_up(64738),
