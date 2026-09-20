@@ -1565,6 +1565,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._nexus_posts()
         if sub.startswith("aether/"):
             return self._nexus_aether(sub[len("aether/"):])
+        if sub.startswith("rss-fetch"):
+            return self._nexus_rss_fetch()
+        if sub.startswith("spider"):
+            return self._nexus_spider()
+        if sub.startswith("search-web"):
+            return self._nexus_search_web()
         return self._json({"error": f"unknown nexus API route: {path}"}, 404)
 
     # ── twtxt feed ───────────────────────────────────────────────────────────
@@ -1879,6 +1885,109 @@ class Handler(BaseHTTPRequestHandler):
                 return j["choices"][0]["message"]["content"].strip()
         except Exception as e:
             return f"[{persona} is off-air — aichat :3030 unreachable: {e}]"
+
+    # ── Dock plugins: RSS / Spider / Web search (zero-dep) ─────────────────────
+
+    def _nexus_rss_fetch(self):
+        """GET /api/nexus/rss-fetch?url=... → parse RSS/Atom → {items:[{title,link,pubDate}]}."""
+        import urllib.parse as _up, xml.etree.ElementTree as ET
+        qs  = _up.parse_qs(_up.urlparse(self.path).query)
+        url = qs.get("url", [""])[0]
+        if not url:
+            return self._json({"error": "url required"}, 400)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                raw = r.read()
+        except Exception as e:
+            return self._json({"error": f"fetch failed: {e}", "items": []}, 502)
+        items = []
+        try:
+            root = ET.fromstring(raw)
+            # RSS <item> or Atom <entry>
+            for it in root.iter():
+                tag = it.tag.split("}")[-1]
+                if tag not in ("item", "entry"):
+                    continue
+                title = link = pub = ""
+                for c in it:
+                    ct = c.tag.split("}")[-1]
+                    if ct == "title": title = (c.text or "").strip()
+                    elif ct == "link":
+                        link = (c.get("href") or c.text or "").strip()
+                    elif ct in ("pubDate", "updated", "published"):
+                        pub = (c.text or "").strip()
+                if title:
+                    items.append({"title": title, "link": link, "pubDate": pub})
+                if len(items) >= 40:
+                    break
+        except Exception as e:
+            return self._json({"error": f"parse failed: {e}", "items": []}, 200)
+        return self._json({"items": items})
+
+    def _nexus_spider(self):
+        """GET /api/nexus/spider?url=...&depth=1 → extract links → {links:[{href,text}]}."""
+        import urllib.parse as _up
+        from html.parser import HTMLParser
+        qs  = _up.parse_qs(_up.urlparse(self.path).query)
+        url = qs.get("url", [""])[0]
+        if not url:
+            return self._json({"error": "url required"}, 400)
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        class _LinkGrab(HTMLParser):
+            def __init__(self): super().__init__(); self.links = []; self._href = None; self._txt = []
+            def handle_starttag(self, tag, attrs):
+                if tag == "a":
+                    self._href = dict(attrs).get("href"); self._txt = []
+            def handle_data(self, data):
+                if self._href is not None: self._txt.append(data)
+            def handle_endtag(self, tag):
+                if tag == "a" and self._href:
+                    text = " ".join("".join(self._txt).split())[:120]
+                    href = _up.urljoin(url, self._href)
+                    if href.startswith("http"):
+                        self.links.append({"href": href, "text": text or href})
+                    self._href = None
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                html = r.read().decode("utf-8", "replace")
+        except Exception as e:
+            return self._json({"error": f"fetch failed: {e}", "links": []}, 502)
+        p = _LinkGrab(); p.feed(html)
+        seen, uniq = set(), []
+        for l in p.links:
+            if l["href"] in seen: continue
+            seen.add(l["href"]); uniq.append(l)
+            if len(uniq) >= 100: break
+        return self._json({"url": url, "links": uniq})
+
+    def _nexus_search_web(self):
+        """GET /api/nexus/search-web?q=... → DuckDuckGo HTML results → {results:[{title,href}]}."""
+        import urllib.parse as _up, html as _html, re as _re
+        qs = _up.parse_qs(_up.urlparse(self.path).query)
+        q  = qs.get("q", [""])[0]
+        if not q:
+            return self._json({"error": "q required"}, 400)
+        try:
+            data = _up.urlencode({"q": q}).encode()
+            req = urllib.request.Request("https://html.duckduckgo.com/html/", data=data,
+                                         headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                page = r.read().decode("utf-8", "replace")
+        except Exception as e:
+            return self._json({"error": f"search failed: {e}", "results": []}, 502)
+        results = []
+        for m in _re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, _re.S):
+            href = _html.unescape(m.group(1))
+            title = _html.unescape(_re.sub(r"<[^>]+>", "", m.group(2))).strip()
+            if title:
+                results.append({"title": title, "href": href})
+            if len(results) >= 25:
+                break
+        return self._json({"query": q, "results": results})
 
     # ── App TCP health check ──────────────────────────────────────────────────
 
